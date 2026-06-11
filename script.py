@@ -1337,21 +1337,25 @@ class PipelineFactory:
             "full_scaled", "full_robust", "pca", "selectkbest", "selectkbest_mi",
         )
         use_robust = (feature_strategy == "full_robust")
+
+        # Never mutate self.fc — take a local deep copy for this build only.
+        # This is safe under any parallelism (Joblib, Optuna parallel trials)
+        # and immune to exceptions leaving shared state corrupted.
+        local_fc = copy.deepcopy(self.fc)
         if use_robust:
-            # Temporarily swap scaler strategy
-            orig_scaler = self.fc.numeric_scaler
-            self.fc.numeric_scaler = "robust"
+            local_fc.numeric_scaler = "robust"         # mutates only the local copy
 
         # CLR columns (opt-in)
         clr_cols: List[str] = []
-        if self.fc.apply_clr_transform and self.fc.clr_column_pattern:
+        if local_fc.apply_clr_transform and local_fc.clr_column_pattern:
             try:
-                pat = re.compile(self.fc.clr_column_pattern)
+                pat = re.compile(local_fc.clr_column_pattern)
                 clr_cols = [c for c in ds.numeric_columns if pat.search(c)]
             except re.error:
-                logger.warning(f"Invalid clr_column_pattern: '{self.fc.clr_column_pattern}'")
+                logger.warning(f"Invalid clr_column_pattern: '{local_fc.clr_column_pattern}'")
 
-        preprocessor = self._preproc_builder.build(
+        local_preproc_builder = PreprocessorBuilder(local_fc, self.rs)
+        preprocessor = local_preproc_builder.build(
             numeric_cols=ds.numeric_columns,
             categorical_cols=ds.categorical_columns,
             datetime_cols=ds.datetime_columns,
@@ -1359,8 +1363,6 @@ class PipelineFactory:
             for_linear=is_linear,
             clr_cols=clr_cols,
         )
-        if use_robust:
-            self.fc.numeric_scaler = orig_scaler   # restore
 
         steps: list = [("preprocessor", preprocessor)]
 
