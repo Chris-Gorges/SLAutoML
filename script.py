@@ -78,6 +78,7 @@ import sqlite3
 import sys
 import time
 import warnings
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -2274,12 +2275,11 @@ class NestedCVRunner:
         label: str,
         model_name: str,
         feature_strategy: str,
-        target_transform: str,
     ) -> ExperimentResult:
         exp = ExperimentResult(
             label=label, model_name=model_name,
             feature_strategy=feature_strategy,
-            target_transform=target_transform,
+            target_transform="auto",
         )
         outer_cv, use_grp = self._outer_cv(groups, len(y))
         Xr = X.reset_index(drop=True)
@@ -2309,7 +2309,15 @@ class NestedCVRunner:
                 X_hpo, y_hpo, g_hpo = X_tr_full, y_tr_full, g_tr_full
                 cal_idx = np.array([], dtype=int)
 
-            # ── 2. Per-fold target transform — fit on HPO train only ──────────
+            # ── 2. Resolve target transform using ONLY this fold's training data ──
+            target_transform = TargetTransformer.auto_select(
+                y_tr_full, self.tcfg, label
+            )
+            # Update ExperimentResult metadata on first fold (representative value)
+            if fold_idx == 1:
+                exp.target_transform = target_transform
+            logger.info(f"    Fold {fold_idx}: target_transform='{target_transform}'")
+
             tt      = TargetTransformer(target_transform, random_state=self.cfg.random_state)
             y_hpo_t = pd.Series(tt.fit_transform(y_hpo.values), index=y_hpo.index)
 
@@ -2446,8 +2454,7 @@ class NestedCVRunner:
             y = ds.df_targets.loc[mask, label].astype(float).copy()
             g = ds.groups.loc[mask].copy() if ds.groups is not None else None
 
-            target_transform = TargetTransformer.auto_select(y, self.tcfg, label)
-            logger.info(f"  Transform: {target_transform} | n_valid={n_valid}")
+            logger.info(f"  n_valid={n_valid}")
 
             for model_name in names:
                 logger.info(f"\n  ── Model: {model_name} ──")
@@ -2458,7 +2465,6 @@ class NestedCVRunner:
                             X=X, y=y, groups=g, ds=ds,
                             label=label, model_name=model_name,
                             feature_strategy=fs,
-                            target_transform=target_transform,
                         )
                         if res.fold_results:
                             self.rm.add(res)
