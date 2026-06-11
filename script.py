@@ -632,8 +632,27 @@ class CorrelationFilter(BaseEstimator, TransformerMixin):
             self._keep_idx = np.arange(self._n_input)
             return self
         df_tmp = pd.DataFrame(X_arr).fillna(0.0)
+
+        # --- NaN guard ---------------------------------------------------------
+        # Zero-variance columns produce NaN in the entire row/column of the
+        # Pearson correlation matrix (division by σ=0).  We pre-emptively drop
+        # them here so the pairwise loop never sees a NaN value.
+        zero_var_cols = set(
+            int(i) for i in np.where(df_tmp.std(axis=0) == 0.0)[0]
+        )
+        if zero_var_cols:
+            logger.debug(
+                f"  CorrelationFilter: {len(zero_var_cols)} zero-variance "
+                f"column(s) dropped before correlation check."
+            )
+
         corr = df_tmp.corr(method="pearson").abs().values
-        drop: set = set()
+        # Replace any residual NaNs (e.g. edge cases) with 0.0 so the
+        # threshold comparison is always well-defined.
+        corr = np.where(np.isnan(corr), 0.0, corr)
+        # -----------------------------------------------------------------------
+
+        drop: set = set(zero_var_cols)   # zero-variance columns are always dropped
         n = corr.shape[0]
         for j in range(n):
             if j in drop:
