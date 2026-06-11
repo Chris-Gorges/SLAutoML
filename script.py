@@ -1573,40 +1573,52 @@ class ConformalPredictor:
 class FeatureStabilityTracker:
     """
     Records which features survive selection across outer folds.
-    Uses real post-preprocessor feature names wherever recoverable.
+
+    Memory-efficient design: instead of storing one dictionary per
+    (feature, fold, model, strategy) record, we maintain a rolling mean
+    incrementally.  Peak memory is O(unique_features × unique_groups)
+    rather than O(features × folds × strategies × labels).
     """
 
     def __init__(self) -> None:
-        self._records: List[Dict[str, Any]] = []
+        # Key: (label, model_name, strategy, feature_name)
+        # Value: [running_sum, running_count]
+        self._stats: Dict[Tuple[str, str, str, str], List[float]] = {}
 
     def record(
         self,
         feature_names: List[str],
         selected_mask: np.ndarray,
-        fold_idx: int,
+        fold_idx: int,          # kept for API compatibility; not stored
         label: str,
         model_name: str,
         strategy: str,
     ) -> None:
         n = min(len(feature_names), len(selected_mask))
         for i in range(n):
-            self._records.append({
-                "feature":  feature_names[i],
-                "selected": int(selected_mask[i]),
-                "fold":     fold_idx,
-                "label":    label,
-                "model":    model_name,
-                "strategy": strategy,
-            })
+            key = (label, model_name, strategy, feature_names[i])
+            entry = self._stats.get(key)
+            if entry is None:
+                self._stats[key] = [float(selected_mask[i]), 1.0]
+            else:
+                entry[0] += float(selected_mask[i])
+                entry[1] += 1.0
 
     def summary(self) -> pd.DataFrame:
-        if not self._records:
+        if not self._stats:
             return pd.DataFrame()
-        df = pd.DataFrame(self._records)
+        rows = [
+            {
+                "label":           key[0],
+                "model":           key[1],
+                "strategy":        key[2],
+                "feature":         key[3],
+                "stability_score": val[0] / val[1],
+            }
+            for key, val in self._stats.items()
+        ]
         return (
-            df.groupby(["label", "model", "strategy", "feature"])["selected"]
-            .mean().reset_index()
-            .rename(columns={"selected": "stability_score"})
+            pd.DataFrame(rows)
             .sort_values(["label", "stability_score"], ascending=[True, False])
             .reset_index(drop=True)
         )
@@ -1616,6 +1628,7 @@ class FeatureStabilityTracker:
         if not df.empty:
             df.to_csv(output_dir / "feature_stability.csv", index=False)
             logger.info("Feature stability report saved.")
+
 
 
 # =============================================================================
