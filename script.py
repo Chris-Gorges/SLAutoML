@@ -174,6 +174,13 @@ try:
 except ImportError:
     HAS_SQLALCHEMY = False
 
+# TargetEncoder was added in scikit-learn 1.3
+try:
+    from sklearn.preprocessing import TargetEncoder
+    HAS_TARGET_ENCODER = True
+except ImportError:
+    HAS_TARGET_ENCODER = False
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -494,8 +501,14 @@ class TypeInferenceEngine:
                 return "datetime"
             except Exception:
                 pass
-            # High-cardinality string → drop
-            return "drop"
+            # High-cardinality string → target-encode instead of dropping.
+            # TargetEncoder converts each level to the mean of the target,
+            # computed exclusively on the training fold (leakage-safe via CV).
+            logger.debug(
+                f"  High-cardinality string column detected "
+                f"({n_unique} unique values) — role='high_cardinality'."
+            )
+            return "high_cardinality"
 
         return "drop"
 
@@ -1007,6 +1020,7 @@ class Dataset:
     numeric_columns: List[str]
     categorical_columns: List[str]
     datetime_columns: List[str]
+    high_cardinality_columns: List[str] = field(default_factory=list)   # target-encoded HC strings
     groups: Optional[pd.Series] = None
     sample_weights: Optional[pd.Series] = None
 
@@ -1075,17 +1089,19 @@ class DatasetBuilder:
         type_engine = TypeInferenceEngine(self.fc)
         type_engine.fit(df, exclude_columns=list(exclude))
 
-        num_cols = type_engine.columns_of_role("numeric")
-        cat_cols = type_engine.columns_of_role("categorical")
-        dt_cols  = type_engine.columns_of_role("datetime")
-        feature_cols = num_cols + cat_cols + dt_cols
+        num_cols  = type_engine.columns_of_role("numeric")
+        cat_cols  = type_engine.columns_of_role("categorical")
+        dt_cols   = type_engine.columns_of_role("datetime")
+        hc_cols   = type_engine.columns_of_role("high_cardinality")
+        feature_cols = num_cols + cat_cols + dt_cols + hc_cols
 
         df_features = df[feature_cols].reset_index(drop=True)
         df_targets = df_targets.reset_index(drop=True)
 
         logger.info(
             f"Dataset ready: {len(df_features)} samples × {len(feature_cols)} features "
-            f"(numeric={len(num_cols)}, categorical={len(cat_cols)}, datetime={len(dt_cols)}) "
+            f"(numeric={len(num_cols)}, categorical={len(cat_cols)}, "
+            f"datetime={len(dt_cols)}, high_cardinality={len(hc_cols)}) "
             f"× {len(target_cols)} targets"
             + (f" × {groups.nunique()} groups" if groups is not None else "")
             + "."
@@ -1098,6 +1114,7 @@ class DatasetBuilder:
             numeric_columns=num_cols,
             categorical_columns=cat_cols,
             datetime_columns=dt_cols,
+            high_cardinality_columns=hc_cols,
             groups=groups,
             sample_weights=sample_weights,
         )
@@ -1257,6 +1274,7 @@ class PreprocessorBuilder:
         with_scale: bool,
         for_linear: bool,
         clr_cols: Optional[List[str]] = None,
+        high_cardinality_cols: Optional[List[str]] = None,
     ) -> ColumnTransformer:
         clr_cols = clr_cols or []
         plain_numeric = [c for c in numeric_cols if c not in clr_cols]
@@ -1321,6 +1339,37 @@ class PreprocessorBuilder:
             if with_scale:
                 dt_steps.append(("scaler", StandardScaler()))
             transformers.append(("dt", Pipeline(dt_steps), datetime_cols))
+
+        # ── High-cardinality strings (Target Encoding) ────────────────────────
+        # TargetEncoder (sklearn ≥ 1.3) uses cross-fitting internally to avoid
+        # within-fold leakage.  For older sklearn we fall back to OrdinalEncoder
+        # so the pipeline still runs — just without the quality boost.
+        hc_cols = [c for c in (high_cardinality_cols or []) if c not in clr_cols]
+        if hc_cols:
+            if HAS_TARGET_ENCODER:
+                hc_encoder = TargetEncoder(
+                    target_type="continuous",
+                    smooth="auto",           # empirical Bayes shrinkage
+                    cv=5,
+                )
+            else:
+                logger.warning(
+                    "scikit-learn < 1.3: TargetEncoder unavailable. "
+                    "High-cardinality columns will use OrdinalEncoder as fallback. "
+                    "Upgrade to sklearn ≥ 1.3 for proper target encoding."
+                )
+                hc_encoder = OrdinalEncoder(
+                    handle_unknown="use_encoded_value", unknown_value=-1
+                )
+            hc_steps: list = [
+                ("imputer", SimpleImputer(
+                    strategy=self.fc.categorical_imputer_strategy
+                )),
+                ("encoder", hc_encoder),
+            ]
+            if with_scale:
+                hc_steps.append(("scaler", StandardScaler()))
+            transformers.append(("hc", Pipeline(hc_steps), hc_cols))
 
         # ── CLR (opt-in) ──────────────────────────────────────────────────────
         if clr_cols:
@@ -1438,6 +1487,7 @@ class PipelineFactory:
             with_scale=needs_scale,
             for_linear=is_linear,
             clr_cols=clr_cols,
+            high_cardinality_cols=ds.high_cardinality_columns,
         )
 
         # Inject cat_features into the model before wrapping it in a Pipeline.
@@ -2127,7 +2177,9 @@ class MultiTaskRunner:
                     numeric_cols=ds.numeric_columns,
                     categorical_cols=ds.categorical_columns,
                     datetime_cols=ds.datetime_columns,
-                    with_scale=True, for_linear=False,
+                    with_scale=True,
+                    for_linear=False,
+                    high_cardinality_cols=ds.high_cardinality_columns,
                 )
                 Xtr = pre.fit_transform(X.iloc[tr])
                 Xte = pre.transform(X.iloc[te])
