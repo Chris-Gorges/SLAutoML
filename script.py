@@ -1209,9 +1209,16 @@ class PreprocessorBuilder:
     - CLR:         impute → CLRTransformer → StandardScaler  (opt-in)
     """
 
-    def __init__(self, feat_config: FeatureConfig, random_state: int = 42) -> None:
+    def __init__(
+        self,
+        feat_config: FeatureConfig,
+        random_state: int = 42,
+        for_native_cat: bool = False,
+    ) -> None:
         self.fc = feat_config
         self.rs = random_state
+        self.for_native_cat = for_native_cat
+        self.cat_feature_indices_: List[int] = []  # populated in build() when for_native_cat=True
 
     def _make_scaler(self, strategy: str):
         return {
@@ -1271,8 +1278,18 @@ class PreprocessorBuilder:
                 cat_steps.append(("encoder", ohe))
                 if with_scale:
                     cat_steps.append(("scaler", StandardScaler()))
+            elif self.for_native_cat:
+                # CatBoost / LightGBM: pass raw strings through so the model's
+                # native categorical algorithm operates on the original values.
+                # We record cat_feature_indices_ so PipelineFactory can forward
+                # them to the model constructor / fit() call.
+                n_num_out = len(plain_numeric)  # numeric block comes first in ColumnTransformer
+                self.cat_feature_indices_ = list(range(n_num_out, n_num_out + len(categorical_cols)))
+                # Still impute missing values (fill with the mode string) but do NOT
+                # append an OrdinalEncoder — keep the column values as strings.
             else:
-                # Ordinal is fine for tree-based models and is much lighter
+                # Generic tree-based models (RF, XGB, etc.): Ordinal is correct
+                # because they treat every split threshold numerically.
                 cat_steps.append((
                     "encoder",
                     OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1),
@@ -1304,6 +1321,38 @@ class PreprocessorBuilder:
                 raise ValueError("No usable feature columns found.")
 
         return ColumnTransformer(transformers=transformers, remainder="drop")
+
+
+class _CatBoostNativeCatAdapter(BaseEstimator, RegressorMixin):
+    """
+    Thin sklearn-compatible wrapper that forwards cat_features to
+    CatBoostRegressor.fit() so the native categorical algorithm is used
+    without breaking the sklearn Pipeline contract.
+    """
+
+    def __init__(self, catboost_model, cat_feature_indices: List[int]) -> None:
+        self.catboost_model = catboost_model
+        self.cat_feature_indices = cat_feature_indices
+
+    def fit(self, X, y, **fit_params):
+        self.catboost_model.fit(X, y, cat_features=self.cat_feature_indices, **fit_params)
+        return self
+
+    def predict(self, X):
+        return self.catboost_model.predict(X)
+
+    def get_params(self, deep=True):
+        p = {"cat_feature_indices": self.cat_feature_indices}
+        p.update(self.catboost_model.get_params(deep=deep))
+        return p
+
+    def set_params(self, **params):
+        self.catboost_model.set_params(**{
+            k: v for k, v in params.items() if k != "cat_feature_indices"
+        })
+        if "cat_feature_indices" in params:
+            self.cat_feature_indices = params["cat_feature_indices"]
+        return self
 
 
 class PipelineFactory:
@@ -1354,7 +1403,15 @@ class PipelineFactory:
             except re.error:
                 logger.warning(f"Invalid clr_column_pattern: '{local_fc.clr_column_pattern}'")
 
-        local_preproc_builder = PreprocessorBuilder(local_fc, self.rs)
+        _NATIVE_CAT_MODELS: set = set()
+        if HAS_LGBM:
+            _NATIVE_CAT_MODELS.add("lightgbm")
+        if HAS_CATBOOST:
+            _NATIVE_CAT_MODELS.add("catboost")
+
+        for_native_cat = model_name in _NATIVE_CAT_MODELS and bool(ds.categorical_columns)
+
+        local_preproc_builder = PreprocessorBuilder(local_fc, self.rs, for_native_cat=for_native_cat)
         preprocessor = local_preproc_builder.build(
             numeric_cols=ds.numeric_columns,
             categorical_cols=ds.categorical_columns,
@@ -1363,6 +1420,18 @@ class PipelineFactory:
             for_linear=is_linear,
             clr_cols=clr_cols,
         )
+
+        # Inject cat_features into the model before wrapping it in a Pipeline.
+        # We do this here because only PipelineFactory knows both the model name
+        # and the preprocessor's column layout simultaneously.
+        if for_native_cat and local_preproc_builder.cat_feature_indices_:
+            cat_idx = local_preproc_builder.cat_feature_indices_
+            if HAS_LGBM and model_name == "lightgbm":
+                model.set_params(categorical_feature=cat_idx)
+            elif HAS_CATBOOST and model_name == "catboost":
+                # CatBoost accepts cat_features in fit(), not the constructor,
+                # so we wrap it in a thin adapter.
+                model = _CatBoostNativeCatAdapter(model, cat_idx)
 
         steps: list = [("preprocessor", preprocessor)]
 
