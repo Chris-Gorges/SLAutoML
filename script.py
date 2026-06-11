@@ -2370,7 +2370,16 @@ class NestedCVRunner:
                     y_cal_pred   = tt_hpo.inverse_transform(np.asarray(y_cal_pred_t, dtype=float))
                     cp  = ConformalPredictor(alpha=self.cfg.conformal_alpha)
                     cp.calibrate(y_cal_true, y_cal_pred)
-                    lo, hi = cp.predict_interval(y_pred)
+
+                    # Test predictions — same model (best_pipe) + same transformer (tt_hpo)
+                    # Exchangeability holds: cal residuals and test residuals are drawn
+                    # from the same model/transform pair.
+                    y_test_pred_t      = best_pipe.predict(X_te)
+                    y_test_pred_conf   = tt_hpo.inverse_transform(
+                        np.asarray(y_test_pred_t, dtype=float)
+                    )
+
+                    lo, hi = cp.predict_interval(y_test_pred_conf)
                     cov = float(np.mean((y_te_arr >= lo) & (y_te_arr <= hi)))
                     wid = cp.interval_width
                 except Exception as exc:
