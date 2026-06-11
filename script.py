@@ -2318,8 +2318,8 @@ class NestedCVRunner:
                 exp.target_transform = target_transform
             logger.info(f"    Fold {fold_idx}: target_transform='{target_transform}'")
 
-            tt      = TargetTransformer(target_transform, random_state=self.cfg.random_state)
-            y_hpo_t = pd.Series(tt.fit_transform(y_hpo.values), index=y_hpo.index)
+            tt_hpo      = TargetTransformer(target_transform, random_state=self.cfg.random_state)
+            y_hpo_t = pd.Series(tt_hpo.fit_transform(y_hpo.values), index=y_hpo.index)
 
             study_name = (
                 f"{sanitize_name(label)}__{model_name}"
@@ -2340,9 +2340,12 @@ class NestedCVRunner:
                 logger.error(f"HPO failed [{study_name}]: {exc}")
                 continue
 
-            # ── 3. Refit best model on FULL outer training set ────────────────
+            # ── 3. tt_final: fitted on full outer training set (y_tr_full) ──────
+            # Owns the transform state for: final_pipe training + test prediction
+            # These two are always consistent with each other.
+            tt_final    = TargetTransformer(target_transform, random_state=self.cfg.random_state)
             y_tr_full_t = pd.Series(
-                tt.fit_transform(y_tr_full.values), index=y_tr_full.index
+                tt_final.fit_transform(y_tr_full.values), index=y_tr_full.index
             )
             best_params_model = self.reg.instantiate(model_name, best_params)
             final_pipe = self.pf.build(model_name, best_params_model, feature_strategy, ds)
@@ -2350,7 +2353,7 @@ class NestedCVRunner:
 
             # ── 4. Predict on test set ────────────────────────────────────────
             y_pred_t  = final_pipe.predict(X_te)
-            y_pred    = tt.inverse_transform(np.asarray(y_pred_t, dtype=float))
+            y_pred    = tt_final.inverse_transform(np.asarray(y_pred_t, dtype=float))
             y_te_arr  = y_te.to_numpy(dtype=float)
             metrics   = compute_metrics(y_te_arr, y_pred)
             elapsed   = time.perf_counter() - t0
@@ -2362,7 +2365,7 @@ class NestedCVRunner:
                     # Transform calibration targets the same way as training
                     y_cal_true = y_tr_full.iloc[cal_idx].to_numpy(dtype=float)
                     y_cal_pred_t = best_pipe.predict(X_tr_full.iloc[cal_idx])
-                    y_cal_pred   = tt.inverse_transform(np.asarray(y_cal_pred_t, dtype=float))
+                    y_cal_pred   = tt_hpo.inverse_transform(np.asarray(y_cal_pred_t, dtype=float))
                     cp  = ConformalPredictor(alpha=self.cfg.conformal_alpha)
                     cp.calibrate(y_cal_true, y_cal_pred)
                     lo, hi = cp.predict_interval(y_pred)
