@@ -645,28 +645,21 @@ class CorrelationFilter(BaseEstimator, TransformerMixin):
         if self._n_input < 2:
             self._keep_idx = np.arange(self._n_input)
             return self
-        df_tmp = pd.DataFrame(X_arr).fillna(0.0)
-
-        # --- NaN guard ---------------------------------------------------------
-        # Zero-variance columns produce NaN in the entire row/column of the
-        # Pearson correlation matrix (division by σ=0).  We pre-emptively drop
-        # them here so the pairwise loop never sees a NaN value.
-        zero_var_cols = set(
-            int(i) for i in np.where(df_tmp.std(axis=0) == 0.0)[0]
-        )
-        if zero_var_cols:
+        df_tmp = pd.DataFrame(X_arr)               # NO fillna: corr() is
+                                                   # pairwise-complete already
+        stds = df_tmp.std(axis=0, ddof=0).to_numpy()
+        # Tolerance-based zero/near-zero variance detection (no exact ==)
+        zero_var = np.where(~np.isfinite(stds) | (stds < 1e-12))[0]
+        drop: set = set(int(i) for i in zero_var)
+        if drop:
             logger.debug(
-                f"  CorrelationFilter: {len(zero_var_cols)} zero-variance "
+                f"  CorrelationFilter: {len(drop)} near-zero-variance "
                 f"column(s) dropped before correlation check."
             )
 
-        corr = df_tmp.corr(method="pearson").abs().values
-        # Replace any residual NaNs (e.g. edge cases) with 0.0 so the
-        # threshold comparison is always well-defined.
-        corr = np.where(np.isnan(corr), 0.0, corr)
-        # -----------------------------------------------------------------------
+        corr = df_tmp.corr(method="pearson", min_periods=2).abs().to_numpy()
+        corr = np.nan_to_num(corr, nan=0.0)        # NaN ⇒ "not correlated"
 
-        drop: set = set(zero_var_cols)   # zero-variance columns are always dropped
         n = corr.shape[0]
         for j in range(n):
             if j in drop:
@@ -679,6 +672,7 @@ class CorrelationFilter(BaseEstimator, TransformerMixin):
             f"  CorrelationFilter: keeping {len(self._keep_idx)}/{n} features."
         )
         return self
+
 
     def transform(self, X) -> np.ndarray:
         if self._keep_idx is None:
