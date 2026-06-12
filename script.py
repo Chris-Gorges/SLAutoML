@@ -293,6 +293,7 @@ class MLConfig:
     # Conformal prediction
     compute_conformal: bool = True
     conformal_alpha: float = 0.10
+    conformal_mode: str = "strict"   # "strict" | "empirical"
     conformal_calibration_fraction: float = 0.20
     # SHAP
     compute_shap: bool = True
@@ -2589,44 +2590,56 @@ class NestedCVRunner:
                 logger.error(f"HPO failed [{study_name}]: {exc}")
                 continue
 
-            # ── 3. tt_final: fitted on full outer training set (y_tr_full) ──────
-            # Owns the transform state for: final_pipe training + test prediction
-            # These two are always consistent with each other.
-            tt_final    = TargetTransformer(target_transform, random_state=self.cfg.random_state)
-            y_tr_full_t = pd.Series(
-                tt_final.fit_transform(y_tr_full.values), index=y_tr_full.index
+            # ── 3. Final model + transformer: ONE consistent pair ────────────
+            strict_conformal = (
+                self.cfg.compute_conformal
+                and self.cfg.conformal_mode == "strict"
+                and len(cal_idx) >= 5
             )
-            best_params_model = self.reg.instantiate(model_name, best_params)
-            final_pipe = self.pf.build(model_name, best_params_model, feature_strategy, ds)
-            final_pipe.fit(X_tr_full, y_tr_full_t)
+            if strict_conformal:
+                # Strict split conformal: do NOT refit on calibration rows.
+                # The reported model IS best_pipe, so fold metrics, point
+                # predictions and intervals all refer to the SAME model and
+                # transform, and the finite-sample guarantee
+                #   P(y ∈ [ŷ − q̂, ŷ + q̂]) ≥ 1 − α
+                # holds exactly.
+                final_pipe  = best_pipe
+                tt_eval     = tt_hpo
+                n_train_eff = len(proper_idx)
+            else:
+                # Empirical mode: refit on the full outer training fold
+                # (calibration guarantee weakened if conformal runs here).
+                tt_final = TargetTransformer(target_transform,
+                                             random_state=self.cfg.random_state)
+                y_tr_full_t = pd.Series(
+                    tt_final.fit_transform(y_tr_full.values), index=y_tr_full.index
+                )
+                final_model = self.reg.instantiate(model_name, best_params)
+                final_pipe  = self.pf.build(model_name, final_model,
+                                            feature_strategy, ds)
+                final_pipe.fit(X_tr_full, y_tr_full_t)
+                tt_eval     = tt_final
+                n_train_eff = len(tr_idx)
 
-            # ── 4. Predict on test set ────────────────────────────────────────
-            y_pred_t  = final_pipe.predict(X_te)
-            y_pred    = tt_final.inverse_transform(np.asarray(y_pred_t, dtype=float))
-            y_te_arr  = y_te.to_numpy(dtype=float)
-            metrics   = compute_metrics(y_te_arr, y_pred)
-            elapsed   = time.perf_counter() - t0
+            # ── 4. Predict on the outer test fold ────────────────────────────
+            y_pred_t = final_pipe.predict(X_te)
+            y_pred   = tt_eval.inverse_transform(np.asarray(y_pred_t, dtype=float))
+            y_te_arr = y_te.to_numpy(dtype=float)
+            metrics  = compute_metrics(y_te_arr, y_pred)
+            elapsed  = time.perf_counter() - t0
 
-            # ── 5. Conformal prediction ───────────────────────────────────────
+            # ── 5. Conformal (same model + transform as the reported preds) ──
             cov, wid = None, None
             if self.cfg.compute_conformal and len(cal_idx) >= 5:
                 try:
-                    # Transform calibration targets the same way as training
-                    y_cal_true = y_tr_full.iloc[cal_idx].to_numpy(dtype=float)
-                    y_cal_pred_t = best_pipe.predict(X_tr_full.iloc[cal_idx])
-                    y_cal_pred   = tt_hpo.inverse_transform(np.asarray(y_cal_pred_t, dtype=float))
-                    cp  = ConformalPredictor(alpha=self.cfg.conformal_alpha)
-                    cp.calibrate(y_cal_true, y_cal_pred)
-
-                    # Test predictions — same model (best_pipe) + same transformer (tt_hpo)
-                    # Exchangeability holds: cal residuals and test residuals are drawn
-                    # from the same model/transform pair.
-                    y_test_pred_t      = best_pipe.predict(X_te)
-                    y_test_pred_conf   = tt_hpo.inverse_transform(
-                        np.asarray(y_test_pred_t, dtype=float)
+                    y_cal_true   = y_tr_full.iloc[cal_idx].to_numpy(dtype=float)
+                    y_cal_pred_t = final_pipe.predict(X_tr_full.iloc[cal_idx])
+                    y_cal_pred   = tt_eval.inverse_transform(
+                        np.asarray(y_cal_pred_t, dtype=float)
                     )
-
-                    lo, hi = cp.predict_interval(y_test_pred_conf)
+                    cp = ConformalPredictor(alpha=self.cfg.conformal_alpha)
+                    cp.calibrate(y_cal_true, y_cal_pred)
+                    lo, hi = cp.predict_interval(y_pred)   # SAME y_pred as metrics
                     cov = float(np.mean((y_te_arr >= lo) & (y_te_arr <= hi)))
                     wid = cp.interval_width
                 except Exception as exc:
@@ -2643,7 +2656,7 @@ class NestedCVRunner:
                 target_transform=target_transform,
                 r2=metrics["r2"], mae=metrics["mae"], medae=metrics["medae"],
                 mse=metrics["mse"], rmse=metrics["rmse"], mape=metrics["mape"],
-                n_train=len(tr_idx), n_test=len(te_idx),
+                n_train=n_train_eff, n_test=len(te_idx),
                 best_params=best_params, y_pred=y_pred, y_test=y_te_arr,
                 elapsed_sec=elapsed,
                 conformal_coverage=cov, conformal_width=wid,
