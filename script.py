@@ -694,6 +694,90 @@ class CorrelationFilter(BaseEstimator, TransformerMixin):
             mask[self._keep_idx] = True
         return mask
 
+    def get_feature_names_out(self, input_features=None) -> np.ndarray:
+        if self._keep_idx is None:
+            raise RuntimeError("CorrelationFilter not fitted.")
+        if input_features is None:
+            input_features = np.array(
+                [f"x{i}" for i in range(self._n_input)], dtype=object
+            )
+        return np.asarray(input_features, dtype=object)[self._keep_idx]
+
+
+class ToCategoryDtype(BaseEstimator, TransformerMixin):
+    """
+    Casts all columns to pandas 'category' dtype with the category sets
+    FROZEN at fit time.
+
+    Why freezing matters: LightGBM splits on the *integer codes* of pandas
+    categoricals. A plain .astype('category') at transform time would
+    produce a different code→level mapping on test data and silently
+    corrupt predictions. Frozen categories guarantee identical codes;
+    unseen test levels map to code -1 (NaN), which LightGBM treats as missing.
+    """
+
+    def fit(self, X, y=None) -> "ToCategoryDtype":
+        Xdf = pd.DataFrame(X)
+        self.columns_ = list(Xdf.columns)
+        self.categories_ = {
+            c: pd.Index(pd.unique(Xdf[c].astype(str))) for c in self.columns_
+        }
+        return self
+
+    def transform(self, X) -> pd.DataFrame:
+        Xdf = pd.DataFrame(X).copy()
+        Xdf.columns = self.columns_
+        for c in self.columns_:
+            Xdf[c] = pd.Categorical(
+                Xdf[c].astype(str), categories=self.categories_[c]
+            )
+        return Xdf
+
+    def get_feature_names_out(self, input_features=None) -> np.ndarray:
+        return np.asarray(
+            self.columns_ if input_features is None else input_features,
+            dtype=object,
+        )
+
+
+class CatBoostNativeRegressor(BaseEstimator, RegressorMixin):
+    """
+    Clone-safe CatBoost wrapper with native categorical handling.
+
+    sklearn contract: __init__ stores its arguments verbatim, so
+    get_params()/set_params() round-trip exactly and sklearn.clone() works
+    (the old adapter crashed clone()). Categorical columns are detected at
+    fit() time from pandas dtypes — no positional index bookkeeping.
+    """
+
+    def __init__(self, catboost_params: Optional[Dict[str, Any]] = None) -> None:
+        self.catboost_params = catboost_params
+
+    @staticmethod
+    def _cat_columns(X: pd.DataFrame) -> List[str]:
+        return [
+            c for c in X.columns
+            if isinstance(X[c].dtype, pd.CategoricalDtype) or X[c].dtype == object
+        ]
+
+    def _as_catboost_frame(self, X) -> pd.DataFrame:
+        X = pd.DataFrame(X).copy()
+        # CatBoost rejects floats/NaN inside cat features → force str
+        for c in getattr(self, "cat_columns_", self._cat_columns(X)):
+            X[c] = X[c].astype(str)
+        return X
+
+    def fit(self, X, y, **fit_params) -> "CatBoostNativeRegressor":
+        X = pd.DataFrame(X)
+        self.cat_columns_ = self._cat_columns(X)
+        X = self._as_catboost_frame(X)
+        self.model_ = CatBoostRegressor(**(self.catboost_params or {}))
+        self.model_.fit(X, y, cat_features=self.cat_columns_ or None, **fit_params)
+        return self
+
+    def predict(self, X) -> np.ndarray:
+        return self.model_.predict(self._as_catboost_frame(X))
+
 
 class TreeFeatureSelector(BaseEstimator, TransformerMixin):
     """ExtraTrees-based feature selector. Leakage-free (fitted on train only)."""
@@ -1254,7 +1338,6 @@ class PreprocessorBuilder:
         self.fc = feat_config
         self.rs = random_state
         self.for_native_cat = for_native_cat
-        self.cat_feature_indices_: List[int] = []  # populated in build() when for_native_cat=True
 
     def _make_scaler(self, strategy: str):
         return {
@@ -1316,14 +1399,12 @@ class PreprocessorBuilder:
                 if with_scale:
                     cat_steps.append(("scaler", StandardScaler()))
             elif self.for_native_cat:
-                # CatBoost / LightGBM: pass raw strings through so the model's
-                # native categorical algorithm operates on the original values.
-                # We record cat_feature_indices_ so PipelineFactory can forward
-                # them to the model constructor / fit() call.
-                n_num_out = len(plain_numeric)  # numeric block comes first in ColumnTransformer
-                self.cat_feature_indices_ = list(range(n_num_out, n_num_out + len(categorical_cols)))
-                # Still impute missing values (fill with the mode string) but do NOT
-                # append an OrdinalEncoder — keep the column values as strings.
+                # CatBoost / LightGBM: impute, then cast to FROZEN pandas
+                # 'category' dtype. Categorical-ness travels with the dtype —
+                # the old positional-index arithmetic broke whenever
+                # VarianceThreshold / CorrelationFilter changed the numeric
+                # block's output width.
+                cat_steps.append(("to_category", ToCategoryDtype()))
             else:
                 # Generic tree-based models (RF, XGB, etc.): Ordinal is correct
                 # because they treat every split threshold numerically.
@@ -1388,39 +1469,12 @@ class PreprocessorBuilder:
             else:
                 raise ValueError("No usable feature columns found.")
 
-        return ColumnTransformer(transformers=transformers, remainder="drop")
-
-
-class _CatBoostNativeCatAdapter(BaseEstimator, RegressorMixin):
-    """
-    Thin sklearn-compatible wrapper that forwards cat_features to
-    CatBoostRegressor.fit() so the native categorical algorithm is used
-    without breaking the sklearn Pipeline contract.
-    """
-
-    def __init__(self, catboost_model, cat_feature_indices: List[int]) -> None:
-        self.catboost_model = catboost_model
-        self.cat_feature_indices = cat_feature_indices
-
-    def fit(self, X, y, **fit_params):
-        self.catboost_model.fit(X, y, cat_features=self.cat_feature_indices, **fit_params)
-        return self
-
-    def predict(self, X):
-        return self.catboost_model.predict(X)
-
-    def get_params(self, deep=True):
-        p = {"cat_feature_indices": self.cat_feature_indices}
-        p.update(self.catboost_model.get_params(deep=deep))
-        return p
-
-    def set_params(self, **params):
-        self.catboost_model.set_params(**{
-            k: v for k, v in params.items() if k != "cat_feature_indices"
-        })
-        if "cat_feature_indices" in params:
-            self.cat_feature_indices = params["cat_feature_indices"]
-        return self
+        ct = ColumnTransformer(transformers=transformers, remainder="drop")
+        if self.for_native_cat:
+            # DataFrame output preserves dtypes so LightGBM ('auto') and
+            # CatBoostNativeRegressor detect categorical columns natively.
+            ct.set_output(transform="pandas")
+        return ct
 
 
 class PipelineFactory:
@@ -1477,7 +1531,16 @@ class PipelineFactory:
         if HAS_CATBOOST:
             _NATIVE_CAT_MODELS.add("catboost")
 
-        for_native_cat = model_name in _NATIVE_CAT_MODELS and bool(ds.categorical_columns)
+        # Native-cat output contains raw category columns. Downstream numeric
+        # selectors (f_regression, ExtraTrees, MI, PCA) would crash on them or
+        # silently invalidate column positions → native handling only for
+        # selector-free strategies; otherwise fall back to OrdinalEncoder.
+        _SELECTOR_STRATEGIES = {"tree_select", "selectkbest", "selectkbest_mi", "pca"}
+        for_native_cat = (
+            model_name in _NATIVE_CAT_MODELS
+            and bool(ds.categorical_columns)
+            and feature_strategy not in _SELECTOR_STRATEGIES
+        )
 
         local_preproc_builder = PreprocessorBuilder(local_fc, self.rs, for_native_cat=for_native_cat)
         preprocessor = local_preproc_builder.build(
@@ -1490,17 +1553,11 @@ class PipelineFactory:
             high_cardinality_cols=ds.high_cardinality_columns,
         )
 
-        # Inject cat_features into the model before wrapping it in a Pipeline.
-        # We do this here because only PipelineFactory knows both the model name
-        # and the preprocessor's column layout simultaneously.
-        if for_native_cat and local_preproc_builder.cat_feature_indices_:
-            cat_idx = local_preproc_builder.cat_feature_indices_
-            if HAS_LGBM and model_name == "lightgbm":
-                model.set_params(categorical_feature=cat_idx)
-            elif HAS_CATBOOST and model_name == "catboost":
-                # CatBoost accepts cat_features in fit(), not the constructor,
-                # so we wrap it in a thin adapter.
-                model = _CatBoostNativeCatAdapter(model, cat_idx)
+        if for_native_cat and model_name == "catboost":
+            # Clone-safe wrapper; cat columns detected from dtypes at fit time.
+            model = CatBoostNativeRegressor(catboost_params=model.get_params())
+        # LightGBM needs no wrapper: with DataFrame input, its default
+        # categorical_feature='auto' uses 'category'-dtype columns natively.
 
         steps: list = [("preprocessor", preprocessor)]
 
@@ -2084,35 +2141,50 @@ class SHAPComputer:
             return
         try:
             fitted_model = pipeline.named_steps["model"]
+            cat_cols: List[str] = getattr(fitted_model, "cat_columns_", [])
+            fitted_model = getattr(fitted_model, "model_", fitted_model)  # unwrap CatBoostNativeRegressor
+
             pre_steps = [(n, s) for n, s in pipeline.steps if n != "model"]
             pre_pipe  = Pipeline(pre_steps) if pre_steps else None
-            X_trans   = pre_pipe.transform(X_train) if pre_pipe is not None else X_train.values
+            X_trans   = pre_pipe.transform(X_train) if pre_pipe is not None else X_train
             if hasattr(X_trans, "toarray"):
                 X_trans = X_trans.toarray()
-            X_trans = np.asarray(X_trans, dtype=float)
+            is_frame = isinstance(X_trans, pd.DataFrame)
+            if not is_frame:
+                X_trans = np.asarray(X_trans, dtype=float)   # only safe when no cats
 
             n = min(self.cfg.shap_sample_size, X_trans.shape[0])
             rng = np.random.default_rng(self.cfg.random_state)
             idx = rng.choice(X_trans.shape[0], n, replace=False)
-            X_sample = X_trans[idx]
+            X_sample = X_trans.iloc[idx] if is_frame else X_trans[idx]
 
             is_linear = model_name in ModelRegistry.LINEAR_MODELS
             is_tree   = model_name in ModelRegistry.TREE_MODELS
             try:
-                if is_tree:
+                if HAS_CATBOOST and isinstance(fitted_model, CatBoostRegressor) and cat_cols:
+                    from catboost import Pool
+                    Xs = pd.DataFrame(X_sample).copy()
+                    for c in cat_cols:
+                        Xs[c] = Xs[c].astype(str)
+                    shap_values = fitted_model.get_feature_importance(
+                        type="ShapValues", data=Pool(Xs, cat_features=cat_cols)
+                    )[:, :-1]                      # last column = expected value
+                elif is_tree:
                     explainer = shap.TreeExplainer(fitted_model)
+                    shap_values = explainer.shap_values(X_sample)
                 elif is_linear:
                     explainer = shap.LinearExplainer(
                         fitted_model, X_trans,
                         feature_perturbation="interventional",
                     )
+                    shap_values = explainer.shap_values(X_sample)
                 else:
                     raise ValueError("Use KernelExplainer fallback.")
-                shap_values = explainer.shap_values(X_sample)
             except Exception:
                 if not self.cfg.shap_kernel_fallback:
                     raise
-                bg = shap.sample(X_trans, min(50, X_trans.shape[0]))
+                X_bg = X_trans.iloc[:50] if is_frame else X_trans[:min(50, X_trans.shape[0])]
+                bg = shap.sample(X_bg, min(50, X_bg.shape[0]))
                 explainer   = shap.KernelExplainer(fitted_model.predict, bg)
                 shap_values = explainer.shap_values(X_sample, nsamples=100)
 
