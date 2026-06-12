@@ -768,10 +768,17 @@ class CatBoostNativeRegressor(BaseEstimator, RegressorMixin):
         return X
 
     def fit(self, X, y, **fit_params) -> "CatBoostNativeRegressor":
+        p = dict(self.catboost_params or {})
+        if "bagging_temperature" in p and "subsample" in p:
+            raise ValueError(
+                "CatBoost: 'bagging_temperature' (Bayesian bootstrap) and "
+                "'subsample' (Bernoulli/MVS) are mutually exclusive — fix the "
+                "search space / instantiator."
+            )
         X = pd.DataFrame(X)
         self.cat_columns_ = self._cat_columns(X)
         X = self._as_catboost_frame(X)
-        self.model_ = CatBoostRegressor(**(self.catboost_params or {}))
+        self.model_ = CatBoostRegressor(**p)
         self.model_.fit(X, y, cat_features=self.cat_columns_ or None, **fit_params)
         return self
 
@@ -1480,6 +1487,16 @@ class PreprocessorBuilder:
 class PipelineFactory:
     """Builds leakage-safe sklearn Pipelines per (model, feature_strategy)."""
 
+    _NATIVE_CAT_MODELS: frozenset = frozenset(
+        (["lightgbm"] if HAS_LGBM else []) +
+        (["catboost"] if HAS_CATBOOST else [])
+    )
+    # Strategies that feed numeric-only selectors downstream — native cat
+    # handling (category dtype columns) must be disabled for these.
+    _SELECTOR_STRATEGIES: frozenset = frozenset(
+        {"tree_select", "selectkbest", "selectkbest_mi", "pca"}
+    )
+
     def __init__(self, feat_config: FeatureConfig, random_state: int = 42) -> None:
         self.fc = feat_config
         self.rs = random_state
@@ -1525,21 +1542,14 @@ class PipelineFactory:
             except re.error:
                 logger.warning(f"Invalid clr_column_pattern: '{local_fc.clr_column_pattern}'")
 
-        _NATIVE_CAT_MODELS: set = set()
-        if HAS_LGBM:
-            _NATIVE_CAT_MODELS.add("lightgbm")
-        if HAS_CATBOOST:
-            _NATIVE_CAT_MODELS.add("catboost")
-
         # Native-cat output contains raw category columns. Downstream numeric
         # selectors (f_regression, ExtraTrees, MI, PCA) would crash on them or
         # silently invalidate column positions → native handling only for
         # selector-free strategies; otherwise fall back to OrdinalEncoder.
-        _SELECTOR_STRATEGIES = {"tree_select", "selectkbest", "selectkbest_mi", "pca"}
         for_native_cat = (
-            model_name in _NATIVE_CAT_MODELS
+            model_name in self._NATIVE_CAT_MODELS
             and bool(ds.categorical_columns)
-            and feature_strategy not in _SELECTOR_STRATEGIES
+            and feature_strategy not in self._SELECTOR_STRATEGIES
         )
 
         local_preproc_builder = PreprocessorBuilder(local_fc, self.rs, for_native_cat=for_native_cat)
@@ -1786,14 +1796,26 @@ class OptunaTuner:
                 "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
             }
         if HAS_CATBOOST and model_name == "catboost":
-            return {
-                "iterations":          trial.suggest_int("iterations",    100, 2000, step=100),
-                "depth":               trial.suggest_int("depth",         3,   10),
-                "learning_rate":       trial.suggest_float("learning_rate", 5e-3, 0.3, log=True),
-                "l2_leaf_reg":         trial.suggest_float("l2_leaf_reg", 1e-8, 20.0, log=True),
-                "subsample":           trial.suggest_float("subsample",   0.5,  1.0),
-                "bagging_temperature": trial.suggest_float("bagging_temperature", 0.0, 1.0),
+            params = {
+                "iterations":    trial.suggest_int("iterations",    100, 2000, step=100),
+                "depth":         trial.suggest_int("depth",         3,   10),
+                "learning_rate": trial.suggest_float("learning_rate", 5e-3, 0.3, log=True),
+                "l2_leaf_reg":   trial.suggest_float("l2_leaf_reg", 1e-8, 20.0, log=True),
+                # subsample and bagging_temperature are MUTUALLY EXCLUSIVE in
+                # CatBoost: bagging_temperature requires bootstrap_type='Bayesian',
+                # subsample requires Bernoulli/MVS. Suggesting both (the old code)
+                # raised CatBoostError on every fit → all trials returned inf.
+                "bootstrap_type": trial.suggest_categorical(
+                    "bootstrap_type", ["Bayesian", "Bernoulli", "MVS"]
+                ),
             }
+            if params["bootstrap_type"] == "Bayesian":
+                params["bagging_temperature"] = trial.suggest_float(
+                    "bagging_temperature", 0.0, 10.0
+                )
+            else:
+                params["subsample"] = trial.suggest_float("subsample", 0.5, 1.0)
+            return params
         return {}
 
     def optimize(
