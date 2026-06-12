@@ -444,11 +444,13 @@ class TypeInferenceEngine:
             self.column_roles[col] = self._infer_role(col, df[col])
 
         counts = {r: sum(v == r for v in self.column_roles.values())
-                  for r in ("numeric", "categorical", "datetime", "drop")}
+                  for r in ("numeric", "categorical", "datetime",
+                            "high_cardinality", "drop")}
         logger.info(
             f"  Type inference: {counts['numeric']} numeric, "
             f"{counts['categorical']} categorical, "
             f"{counts['datetime']} datetime, "
+            f"{counts['high_cardinality']} high-cardinality, "
             f"{counts['drop']} dropped."
         )
         return self
@@ -498,7 +500,7 @@ class TypeInferenceEngine:
                 pass
             # Try parsing as datetime
             try:
-                pd.to_datetime(series.dropna().iloc[:100], infer_datetime_format=True)
+                pd.to_datetime(series.dropna().iloc[:100], errors="raise")
                 return "datetime"
             except Exception:
                 pass
@@ -1480,7 +1482,8 @@ class PreprocessorBuilder:
 
         if not transformers:
             # Safety fallback
-            all_cols = plain_numeric + categorical_cols + datetime_cols
+            hc_cols_fb = [c for c in (high_cardinality_cols or []) if c not in clr_cols]
+            all_cols = plain_numeric + categorical_cols + datetime_cols + hc_cols_fb
             if all_cols:
                 transformers = [("passthrough", SimpleImputer(strategy="median"), all_cols)]
             else:
@@ -1510,7 +1513,6 @@ class PipelineFactory:
     def __init__(self, feat_config: FeatureConfig, random_state: int = 42) -> None:
         self.fc = feat_config
         self.rs = random_state
-        self._preproc_builder = PreprocessorBuilder(feat_config, random_state)
 
     @staticmethod
     def strategies_for_model(model_name: str) -> List[str]:
@@ -1626,6 +1628,12 @@ class ConformalPredictor:
     def calibrate(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
         residuals = np.abs(np.asarray(y_true) - np.asarray(y_pred))
         n = len(residuals)
+        if (n + 1) * (1 - self.alpha) > n:
+            logger.warning(
+                f"Conformal: n_cal={n} too small for alpha={self.alpha} "
+                f"(need n \u2265 {int(np.ceil((1 - self.alpha) / self.alpha))}); "
+                "coverage guarantee does not hold."
+            )
         level = min(1.0, np.ceil((n + 1) * (1 - self.alpha)) / n)
         self._q_hat = float(np.quantile(residuals, level, method="higher"))
         return self._q_hat
@@ -1965,7 +1973,7 @@ class ExperimentResult:
         self.mean_r2   = float(np.nanmean(r2s));   self.std_r2   = float(np.nanstd(r2s))
         self.mean_rmse = float(np.nanmean(rmses)); self.std_rmse = float(np.nanstd(rmses))
         self.mean_mae  = float(np.nanmean(maes));  self.std_mae  = float(np.nanstd(maes))
-        self.ci95_rmse = bootstrap_ci(rmses, stat=np.median)
+        self.ci95_rmse = bootstrap_ci(rmses, stat=np.median, random_state=0)
 
         all_yt = np.concatenate([f.y_test for f in self.fold_results])
         all_yp = np.concatenate([f.y_pred for f in self.fold_results])
@@ -2419,9 +2427,14 @@ class NestedCVRunner:
       1. Split outer training data into proper-train + calibration sets
          BEFORE any HPO (so calibration data never influences HPO).
       2. Run HPO (Optuna) on proper-train using inner CV.
-      3. Refit best model on full outer training set.
-      4. Calibrate ConformalPredictor using calibration set + refitted model.
-      5. Compute metrics, SHAP, permutation importance.
+      3. Strict mode (default): report best_pipe directly (no refit) and
+         calibrate the ConformalPredictor on the held-out calibration set;
+         the finite-sample coverage guarantee P(y ∈ [ŷ−q̂, ŷ+q̂]) ≥ 1−α holds
+         exactly because cal + test residuals are exchangeable draws from the
+         SAME model.
+         Empirical mode: refit on the full outer training fold and calibrate;
+         coverage is empirical only (no formal guarantee).
+      4. Compute metrics, SHAP, permutation importance.
     """
 
     def __init__(
