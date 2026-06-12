@@ -904,6 +904,21 @@ class TargetTransformer:
             return self._qt.inverse_transform(y.reshape(-1, 1)).ravel()
         return y
 
+    def transform(self, y: np.ndarray) -> np.ndarray:
+        """Apply an already-fitted transform to new targets."""
+        y = np.asarray(y, dtype=float).copy()
+        if self.method == "none":
+            return y
+        if self.method == "log1p":
+            return np.log1p(y + self._shift)
+        if self.method == "yeo-johnson" and self._pt is not None:
+            return self._pt.transform(y.reshape(-1, 1)).ravel()
+        if self.method == "box-cox" and self._pt is not None:
+            return self._pt.transform((y + self._shift).reshape(-1, 1)).ravel()
+        if self.method == "quantile-normal" and self._qt is not None:
+            return self._qt.transform(y.reshape(-1, 1)).ravel()
+        return y
+
     @staticmethod
     def auto_select(y: pd.Series, tgt_cfg: TargetConfig, label_name: str) -> str:
         """Heuristically choose a target transform."""
@@ -2281,8 +2296,8 @@ class MultiTaskRunner:
                     datetime_cols=ds.datetime_columns,
                     with_scale=True,
                     for_linear=False,
-                    high_cardinality_cols=ds.high_cardinality_columns,
-                )
+                    high_cardinality_cols=None,   # TargetEncoder needs 1-D y;
+                )                                 # HC cols dropped in multitask
                 Xtr = pre.fit_transform(X.iloc[tr])
                 Xte = pre.transform(X.iloc[te])
                 m = clone(model)
@@ -2665,8 +2680,11 @@ class NestedCVRunner:
             # ── 8. Permutation importance ─────────────────────────────────────
             if self.cfg.compute_permutation_importance:
                 try:
+                    # final_pipe predicts in TRANSFORMED target space →
+                    # score against the transformed y, not the raw y.
+                    y_te_t = pd.Series(tt_eval.transform(y_te_arr), index=y_te.index)
                     pi = sk_permutation_importance(
-                        final_pipe, X_te, y_te,
+                        final_pipe, X_te, y_te_t,
                         n_repeats=self.cfg.permutation_n_repeats,
                         random_state=self.cfg.random_state,
                         n_jobs=self.cfg.n_jobs,
@@ -2707,6 +2725,15 @@ class NestedCVRunner:
             include=self.cfg.include_models, exclude=self.cfg.exclude_models,
         )
         t0 = time.perf_counter()
+
+        if (self.cfg.use_group_cv and ds.high_cardinality_columns
+                and HAS_TARGET_ENCODER):
+            logger.warning(
+                "Group CV + TargetEncoder: sklearn's internal cross-fitting is "
+                "NOT group-aware \u2192 residual target leakage across groups inside "
+                "training folds. Consider drop_columns for high-cardinality "
+                "features or a custom group-aware encoder."
+            )
 
         for l_idx, label in enumerate(ds.target_columns, start=1):
             logger.info(f"\n{'='*70}\n[{l_idx}/{len(ds.target_columns)}] Target: {label}\n{'='*70}")
